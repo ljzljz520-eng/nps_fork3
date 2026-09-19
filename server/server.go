@@ -620,6 +620,8 @@ type WebServer struct {
 	virtualListener *conn.VirtualListener
 	webRuntimeRoot  func() connection.WebRuntimeConfig
 	configRoot      func() *servercfg.Snapshot
+	closeOnce       sync.Once
+	closeErr        error
 }
 
 type httpServeTarget struct {
@@ -708,11 +710,13 @@ func (s *WebServer) Start() error {
 }
 
 func (s *WebServer) Close() error {
-	if s.tcpListener != nil {
-		_ = s.tcpListener.Close()
-	}
-	s.closeVirtualListener()
-	return nil
+	s.closeOnce.Do(func() {
+		if s.tcpListener != nil {
+			s.closeErr = s.tcpListener.Close()
+		}
+		s.closeVirtualListener()
+	})
+	return s.closeErr
 }
 
 func NewWebServer(bridge *bridge.Bridge) *WebServer {

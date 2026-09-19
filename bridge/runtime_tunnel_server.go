@@ -76,7 +76,9 @@ func (s *Bridge) handleTunnelWork(c *conn.Conn, id, ver int, vs, tunnelType stri
 	}
 	node, client := s.attachTunnelNode(id, ver, vs, uuid, anyConn)
 	if ver > 4 {
-		go s.serveTunnelRuntime(anyConn, c, id, ver, vs, tunnelType, authKind, uuid, addr, client, node)
+		s.sessionGo(func() {
+			s.serveTunnelRuntime(anyConn, c, id, ver, vs, tunnelType, authKind, uuid, addr, client, node)
+		})
 	}
 }
 
@@ -85,7 +87,9 @@ func (s *Bridge) handleVisitorWork(c *conn.Conn, id, ver int, vs, tunnelType str
 	if !ok {
 		return
 	}
-	go s.serveVisitorRuntime(anyConn, c, id, ver, vs, tunnelType, authKind, addr)
+	s.sessionGo(func() {
+		s.serveVisitorRuntime(anyConn, c, id, ver, vs, tunnelType, authKind, addr)
+	})
 }
 
 func (s *Bridge) buildRuntimeTunnelConn(c *conn.Conn, ver int, tunnelType string) (any, bool) {
@@ -226,7 +230,10 @@ func (s *Bridge) serveTunnelRuntime(anyConn any, c *conn.Conn, id, ver int, vs, 
 			if mc, ok := nc.(*mux.Conn); ok {
 				mc.SetPriority()
 			}
-			go s.typeDeal(conn.NewConn(nc), id, ver, vs, tunnelType, authKind, false)
+
+			s.sessionGo(func() {
+				s.typeDeal(conn.NewConn(nc), id, ver, vs, tunnelType, authKind, false)
+			})
 		})
 	case *quic.Conn:
 		for {
@@ -236,7 +243,9 @@ func (s *Bridge) serveTunnelRuntime(anyConn any, c *conn.Conn, id, ver int, vs, 
 				return
 			}
 			sc := conn.NewQuicStreamConn(stream, t)
-			go s.typeDeal(conn.NewConn(sc), id, ver, vs, tunnelType, authKind, false)
+			s.sessionGo(func() {
+				s.typeDeal(conn.NewConn(sc), id, ver, vs, tunnelType, authKind, false)
+			})
 		}
 	default:
 		logs.Error("Unknown tunnel type")
@@ -265,9 +274,11 @@ func (s *Bridge) serveVisitorRuntime(anyConn any, c *conn.Conn, id, ver int, vs,
 	case *mux.Mux:
 		conn.Accept(t, func(nc net.Conn) {
 			idle.Inc()
-			go s.typeDeal(conn.NewConn(nc).OnClose(func(*conn.Conn) {
-				idle.Dec()
-			}), id, ver, vs, tunnelType, authKind, false)
+			s.sessionGo(func() {
+				s.typeDeal(conn.NewConn(nc).OnClose(func(*conn.Conn) {
+					idle.Dec()
+				}), id, ver, vs, tunnelType, authKind, false)
+			})
 		})
 	case *quic.Conn:
 		for {
@@ -278,9 +289,11 @@ func (s *Bridge) serveVisitorRuntime(anyConn any, c *conn.Conn, id, ver int, vs,
 			}
 			sc := conn.NewQuicStreamConn(stream, t)
 			idle.Inc()
-			go s.typeDeal(conn.NewConn(sc).OnClose(func(*conn.Conn) {
-				idle.Dec()
-			}), id, ver, vs, tunnelType, authKind, false)
+			s.sessionGo(func() {
+				s.typeDeal(conn.NewConn(sc).OnClose(func(*conn.Conn) {
+					idle.Dec()
+				}), id, ver, vs, tunnelType, authKind, false)
+			})
 		}
 	default:
 		logs.Error("Unknown tunnel type")

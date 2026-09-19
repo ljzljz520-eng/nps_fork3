@@ -1,10 +1,15 @@
 package server
 
 import (
+	"context"
 	"errors"
+	"fmt"
+	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/djylb/nps/bridge"
@@ -46,12 +51,16 @@ func newServerEngineContext() *serverEngineContext {
 		launch: func(run func()) {
 			go run()
 		},
-		exit: os.Exit,
 	}
 	ctx.p2pProbeLauncher = p2pProbeLauncher{
 		checkPort: common.TestUdpPort,
 		start: func(basePort int, enableExtraReply bool) error {
-			return proxy.NewP2PServer(basePort, enableExtraReply).StartBackground()
+			p2pServer := proxy.NewP2PServer(basePort, enableExtraReply)
+			if err := p2pServer.StartBackground(); err != nil {
+				return err
+			}
+			currentP2PServer.set(p2pServer)
+			return nil
 		},
 	}
 	ctx.backgroundLauncher = newBackgroundRuntimeLauncher(
@@ -185,7 +194,11 @@ func wrapBackgroundLoopStart(start func()) func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			go start()
+			engineBackgroundWG.Add(1)
+			go func() {
+				defer engineBackgroundWG.Done()
+				start()
+			}()
 		})
 	}
 }
@@ -233,7 +246,6 @@ type bridgeRuntimeLauncher struct {
 	currentBridge func() *bridge.Bridge
 	start         func(*bridge.Bridge) error
 	launch        func(func())
-	exit          func(int)
 }
 
 func (l bridgeRuntimeLauncher) Start() {
@@ -247,9 +259,6 @@ func (l bridgeRuntimeLauncher) Start() {
 	run := func() {
 		if err := l.start(runtimeBridge); err != nil {
 			logs.Error("start server bridge error %v", err)
-			if l.exit != nil {
-				l.exit(1)
-			}
 		}
 	}
 	if l.launch != nil {
@@ -345,6 +354,9 @@ func (l webRuntimeLauncher) Start(enable bool) {
 	if service == nil {
 		logs.Error("Incorrect startup mode %s", task.Mode)
 		return
+	}
+	if webSrv, ok := service.(*WebServer); ok {
+		currentWebServer.set(webSrv)
 	}
 	if err := service.Start(); err != nil {
 		logs.Error("%v", err)
@@ -737,7 +749,7 @@ func DealBridgeTask() {
 		runtimeBridgeEvents.HandleOpenHost,
 		runtimeBridgeEvents.HandleOpenTask,
 		runtimeBridgeEvents.HandleSecret,
-		nil,
+		engineStop.stop(),
 	)
 }
 
@@ -993,10 +1005,15 @@ func (dbBridgeEventStore) GetTaskBySecret(password string) *file.Tunnel {
 func cleanupRegisteredIPs() {
 	ticker := time.NewTicker(registerCleanupInterval)
 	defer ticker.Stop()
-	for range ticker.C {
-		removed := runtimeState.CleanupExpiredRegistrations(time.Now())
-		if removed > 0 {
-			logs.Info("Cleaned %d expired ip_limit registrations", removed)
+	for {
+		select {
+		case <-engineStop.stop():
+			return
+		case <-ticker.C:
+			removed := runtimeState.CleanupExpiredRegistrations(time.Now())
+			if removed > 0 {
+				logs.Info("Cleaned %d expired ip_limit registrations", removed)
+			}
 		}
 	}
 }
@@ -1140,4 +1157,242 @@ func collectRuntimeHostsByClientUUID(db *file.DbUtils, clientId int, uuid string
 		return true
 	})
 	return hostDelete, hostRefreshIDs
+}
+
+// Bounded shutdown timing. The caller supplies the overall deadline ctx.
+const (
+	engineSessionGrace          = 5 * time.Second
+	engineFlushTimeout          = 5 * time.Second
+	engineBackgroundStopTimeout = 3 * time.Second
+)
+
+// engineStopSignals provides a process-wide channel closed when shutdown
+// begins, used by background loops to stop pulling new work.
+type engineStopSignals struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func newEngineStopSignals() *engineStopSignals {
+	return &engineStopSignals{ch: make(chan struct{})}
+}
+
+func (e *engineStopSignals) begin() {
+	e.once.Do(func() { close(e.ch) })
+}
+
+func (e *engineStopSignals) stop() <-chan struct{} { return e.ch }
+
+var (
+	engineStop         = newEngineStopSignals()
+	engineBackgroundWG sync.WaitGroup // tracks background loop goroutines
+)
+
+// p2pServerHolder retains the running P2P probe server so it can be closed.
+type p2pServerHolder struct {
+	mu sync.Mutex
+	s  *proxy.P2PServer
+}
+
+func (h *p2pServerHolder) set(s *proxy.P2PServer) {
+	h.mu.Lock()
+	h.s = s
+	h.mu.Unlock()
+}
+
+func (h *p2pServerHolder) close() {
+	h.mu.Lock()
+	s := h.s
+	h.s = nil
+	h.mu.Unlock()
+	if s != nil {
+		if err := s.Close(); err != nil {
+			logs.Error("close p2p probe server error: %v", err)
+		}
+	}
+}
+
+// webServerHolder retains the running web management server so it can be
+// closed (its Start blocks until the listeners are closed).
+type webServerHolder struct {
+	mu sync.Mutex
+	s  *WebServer
+}
+
+func (h *webServerHolder) set(s *WebServer) {
+	h.mu.Lock()
+	h.s = s
+	h.mu.Unlock()
+}
+
+func (h *webServerHolder) close() {
+	h.mu.Lock()
+	s := h.s
+	h.s = nil
+	h.mu.Unlock()
+	if s != nil {
+		if err := s.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			logs.Error("close web server error: %v", err)
+		}
+	}
+}
+
+var (
+	currentP2PServer  p2pServerHolder
+	currentWebServer  webServerHolder
+	eventWriterFlush  func(context.Context) error
+	engineShutdownMu  sync.Mutex
+	engineShutdownRan bool
+	engineShutdownErr error
+)
+
+// RegisterEventWriterFlush registers a bounded flush for asynchronous event
+// writers. It is invoked before sessions are force-closed.
+func RegisterEventWriterFlush(fn func(context.Context) error) {
+	eventWriterFlush = fn
+}
+
+// runBounded runs fn in a goroutine and returns its result, or ctx.Err() if fn
+// does not return before ctx is done.
+func runBounded(ctx context.Context, fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// waitEngineWG blocks until wg is drained or ctx is done.
+func waitEngineWG(ctx context.Context, wg *sync.WaitGroup) error {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// flushConfigStore flushes the on-disk configuration store.
+func flushConfigStore() error {
+	file.GetDb().FlushToDisk()
+	return nil
+}
+
+// flushRuntimeWriters performs bounded flushing of config, traffic and event
+// writers before sessions are force-closed. Any flush failure is returned.
+func flushRuntimeWriters(ctx context.Context) error {
+	var failures []error
+	flushCtx, cancel := context.WithTimeout(ctx, engineFlushTimeout)
+	defer cancel()
+
+	if err := runBounded(flushCtx, flushConfigStore); err != nil {
+		failures = append(failures, fmt.Errorf("config flush: %w", err))
+	}
+	if err := runBounded(flushCtx, func() error { runtimeFlow.Flush(); return nil }); err != nil {
+		failures = append(failures, fmt.Errorf("traffic flush: %w", err))
+	}
+	if eventWriterFlush != nil {
+		if err := eventWriterFlush(flushCtx); err != nil {
+			failures = append(failures, fmt.Errorf("event flush: %w", err))
+		}
+	}
+	return errors.Join(failures...)
+}
+
+// ShutdownServerEngine performs a bounded graceful shutdown of the whole
+// server. It is idempotent and safe for concurrent invocation: all callers
+// block until the first orchestration finishes and share its result.
+func ShutdownServerEngine(ctx context.Context) error {
+	// Signal loops to stop accepting new work as early as possible.
+	engineStop.begin()
+
+	engineShutdownMu.Lock()
+	defer engineShutdownMu.Unlock()
+	if engineShutdownRan {
+		return engineShutdownErr
+	}
+	engineShutdownErr = runServerEngineShutdown(ctx)
+	engineShutdownRan = true
+	return engineShutdownErr
+}
+
+func runServerEngineShutdown(ctx context.Context) error {
+	var failures []error
+
+	// 1. Reject new intake on every protocol immediately, before any flushing
+	//    or draining work that could otherwise take seconds.
+	if b := runtimeState.Bridge(); b != nil {
+		b.BeginShutdown()
+	}
+
+	// 2. Flush config/event/traffic writers while existing sessions are still
+	//    alive inside the grace window.
+	if err := flushRuntimeWriters(ctx); err != nil {
+		failures = append(failures, err)
+	}
+
+	// 3. Drain bridge sessions within grace, force close the rest, and reclaim
+	//    bridge goroutines (intake rejection is already in effect).
+	if b := runtimeState.Bridge(); b != nil {
+		if err := b.Shutdown(ctx, engineSessionGrace); err != nil {
+			failures = append(failures, err)
+		}
+	}
+
+	// 4. Stop managed proxy tasks without changing on-disk status.
+	StopManagedTasksPreserveStatus()
+
+	// 5. Close web management and P2P probe runtimes (release their ports).
+	currentWebServer.close()
+	currentP2PServer.close()
+
+	// 6. Wait for background loops to exit (bridge events, register cleanup).
+	bgCtx, cancel := context.WithTimeout(ctx, engineBackgroundStopTimeout)
+	if err := waitEngineWG(bgCtx, &engineBackgroundWG); err != nil {
+		failures = append(failures, err)
+	}
+	cancel()
+
+	if err := errors.Join(failures...); err != nil {
+		logs.Error("server engine shutdown completed with failures: %v", err)
+		return err
+	}
+	return nil
+}
+
+// notifyEngineSignals subscribes to the process termination signals. It is a
+// variable so tests can replace it with a synthetic signal source.
+var notifyEngineSignals = func() (<-chan os.Signal, func()) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGTERM, os.Interrupt)
+	return ch, func() { signal.Stop(ch) }
+}
+
+// InstallShutdownSignalHandler performs a bounded graceful shutdown of the
+// server engine when SIGTERM or SIGINT is received. The returned channel is
+// closed once the shutdown has finished.
+func InstallShutdownSignalHandler(totalTimeout time.Duration) <-chan struct{} {
+	finished := make(chan struct{})
+	sigCh, stopNotify := notifyEngineSignals()
+	go func() {
+		defer close(finished)
+		defer stopNotify()
+		<-sigCh
+		logs.Info("received termination signal, shutting down server engine")
+		ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
+		defer cancel()
+		_ = ShutdownServerEngine(ctx)
+	}()
+	return finished
 }

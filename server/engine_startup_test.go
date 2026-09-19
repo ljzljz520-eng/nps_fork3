@@ -4,7 +4,9 @@ import (
 	"errors"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/djylb/nps/bridge"
 	"github.com/djylb/nps/lib/file"
@@ -170,36 +172,38 @@ func TestBackgroundRuntimeLauncherStartSkipsMissingSteps(t *testing.T) {
 }
 
 func TestNewBackgroundRuntimeLauncherStartsLongLivedLoopsOnlyOnce(t *testing.T) {
-	steps := make([]string, 0, 10)
+	// Wrapped long-lived loops run in tracked goroutines and start at most
+	// once; init steps run synchronously on every Start call.
+	var bridgeEvents, registerCleanup, initDashboard, initRuntime atomic.Int32
 
 	launcher := newBackgroundRuntimeLauncher(
-		func() {
-			steps = append(steps, "bridgeEvents")
-		},
-		func() {
-			steps = append(steps, "registerCleanup")
-		},
-		func() {
-			steps = append(steps, "initDashboard")
-		},
-		func() {
-			steps = append(steps, "initRuntime")
-		},
+		func() { bridgeEvents.Add(1) },
+		func() { registerCleanup.Add(1) },
+		func() { initDashboard.Add(1) },
+		func() { initRuntime.Add(1) },
 	)
 
 	launcher.Start()
 	launcher.Start()
 
-	want := []string{
-		"bridgeEvents",
-		"registerCleanup",
-		"initRuntime",
-		"initDashboard",
-		"initRuntime",
-		"initDashboard",
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if bridgeEvents.Load() == 1 && registerCleanup.Load() == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
-	if !reflect.DeepEqual(steps, want) {
-		t.Fatalf("background runtime steps = %v, want %v", steps, want)
+	if got := bridgeEvents.Load(); got != 1 {
+		t.Fatalf("bridgeEvents runs = %d, want 1", got)
+	}
+	if got := registerCleanup.Load(); got != 1 {
+		t.Fatalf("registerCleanup runs = %d, want 1", got)
+	}
+	if got := initRuntime.Load(); got != 2 {
+		t.Fatalf("initRuntime runs = %d, want 2", got)
+	}
+	if got := initDashboard.Load(); got != 2 {
+		t.Fatalf("initDashboard runs = %d, want 2", got)
 	}
 }
 
@@ -289,9 +293,6 @@ func TestBridgeRuntimeLauncherStartLaunchesCurrentBridge(t *testing.T) {
 			steps = append(steps, "launch")
 			run()
 		},
-		exit: func(int) {
-			t.Fatal("exit should not be called on successful bridge start")
-		},
 	}.Start()
 
 	want := []string{"bridge", "launch", "start"}
@@ -300,26 +301,35 @@ func TestBridgeRuntimeLauncherStartLaunchesCurrentBridge(t *testing.T) {
 	}
 }
 
-func TestBridgeRuntimeLauncherStartExitsOnStartError(t *testing.T) {
-	exitCodes := make([]int, 0, 1)
+func TestBridgeRuntimeLauncherStartReturnsOnStartError(t *testing.T) {
+	// A start failure must be logged, not terminate the whole process, so the
+	// caller (e.g. a service manager) stays in control of the lifecycle.
+	startCalls := 0
+	returned := make(chan struct{})
 
-	bridgeRuntimeLauncher{
-		currentBridge: func() *bridge.Bridge {
-			return &bridge.Bridge{}
-		},
-		start: func(*bridge.Bridge) error {
-			return errors.New("boom")
-		},
-		launch: func(run func()) {
-			run()
-		},
-		exit: func(code int) {
-			exitCodes = append(exitCodes, code)
-		},
-	}.Start()
+	go func() {
+		defer close(returned)
+		bridgeRuntimeLauncher{
+			currentBridge: func() *bridge.Bridge {
+				return &bridge.Bridge{}
+			},
+			start: func(*bridge.Bridge) error {
+				startCalls++
+				return errors.New("boom")
+			},
+			launch: func(run func()) {
+				run()
+			},
+		}.Start()
+	}()
 
-	if !reflect.DeepEqual(exitCodes, []int{1}) {
-		t.Fatalf("exit codes = %v, want [1]", exitCodes)
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("bridge launcher did not return after start error")
+	}
+	if startCalls != 1 {
+		t.Fatalf("start calls = %d, want 1", startCalls)
 	}
 }
 

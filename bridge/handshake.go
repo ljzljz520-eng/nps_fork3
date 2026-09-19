@@ -578,7 +578,7 @@ func (s *Bridge) register(c *conn.Conn) {
 }
 
 func (s *Bridge) handleRegisterWork(c *conn.Conn) {
-	go s.register(c)
+	s.sessionGo(func() { s.register(c) })
 }
 
 func (s *Bridge) handleSecretWork(c *conn.Conn) {
@@ -670,7 +670,7 @@ func (s *Bridge) handleP2PConnectWork(c *conn.Conn, id int, uuid string, ver int
 		_ = c.Close()
 		return
 	}
-	go session.serve(common.WORK_P2P_VISITOR, c)
+	s.sessionGo(func() { session.serve(common.WORK_P2P_VISITOR, c) })
 }
 
 func (s *Bridge) handleP2PSessionWork(c *conn.Conn, id int) {
@@ -688,7 +688,7 @@ func (s *Bridge) handleP2PSessionWork(c *conn.Conn, id int) {
 		_ = c.Close()
 		return
 	}
-	go session.serve(common.WORK_P2P_PROVIDER, c)
+	s.sessionGo(func() { session.serve(common.WORK_P2P_PROVIDER, c) })
 }
 
 func buildBridgeP2PResolveResult(target bridgeP2PResolvedRoute) p2p.P2PResolveResult {
@@ -780,7 +780,7 @@ func (s *Bridge) handleMainWork(c *conn.Conn, id, ver int, vs, uuid string, addr
 		}
 	}
 	client.MarkConnectedNow()
-	go s.GetHealthFromClient(id, c, client, node)
+	s.sessionGo(func() { s.GetHealthFromClient(id, c, client, node) })
 	logs.Info("ClientId %d connection succeeded, address:%v ", id, addr)
 }
 
@@ -791,7 +791,7 @@ func (s *Bridge) handleConfigWork(c *conn.Conn, id, ver int, vs, uuid string, is
 		return
 	}
 	_ = binary.Write(c, binary.LittleEndian, isPub)
-	go s.getConfig(c, isPub, client, ver, vs, uuid)
+	s.sessionGo(func() { s.getConfig(c, isPub, client, ver, vs, uuid) })
 }
 
 func (s *Bridge) CliProcess(c *conn.Conn, tunnelType string) {
@@ -799,8 +799,7 @@ func (s *Bridge) CliProcess(c *conn.Conn, tunnelType string) {
 	if !ok {
 		return
 	}
-	go s.typeDeal(c, auth.id, hs.ver, hs.clientVer, tunnelType, bridgeAuthKindForClient(auth.client), true)
-	//return
+	s.typeDeal(c, auth.id, hs.ver, hs.clientVer, tunnelType, bridgeAuthKindForClient(auth.client), true)
 }
 
 func (s *Bridge) resolveBridgeClientProcess(c *conn.Conn, tunnelType string) (bridgeHandshakeAuthResult, bridgeHandshakeVersion, bool) {

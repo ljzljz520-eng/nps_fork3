@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/djylb/nps/lib/common"
 	"github.com/djylb/nps/lib/logs"
@@ -116,11 +117,48 @@ func processExists(pid int) bool {
 	return strings.TrimSpace(string(out)) == strconv.Itoa(pid)
 }
 
+// gracefulTerminateTimeout is how long the service manager waits for the
+// process to exit after a graceful termination signal before forcing it.
+const gracefulTerminateTimeout = 10 * time.Second
+
+// waitProcessExit polls for the process to disappear.
+func waitProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if !processExistsFn(pid) {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func terminateProcess(pid int) error {
 	if common.IsWindows() {
+		// Request a graceful close first; force the process if it remains.
+		if err := exec.Command("taskkill", "/PID", strconv.Itoa(pid)).Run(); err == nil &&
+			waitProcessExit(pid, gracefulTerminateTimeout) {
+			return nil
+		}
 		return exec.Command("taskkill", "/F", "/PID", strconv.Itoa(pid)).Run()
 	}
-	return exec.Command("kill", "-9", strconv.Itoa(pid)).Run()
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	if err := proc.Signal(syscall.SIGTERM); err != nil {
+		if !errors.Is(err, os.ErrProcessDone) {
+			return proc.Signal(syscall.SIGKILL)
+		}
+		return nil
+	}
+	if waitProcessExit(pid, gracefulTerminateTimeout) {
+		return nil
+	}
+	// Grace period elapsed: force termination.
+	return proc.Signal(syscall.SIGKILL)
 }
 
 func signalReload(pid int) error {

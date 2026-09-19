@@ -1,7 +1,10 @@
 package bridge
 
 import (
+	"context"
 	"crypto/tls"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -18,6 +21,7 @@ import (
 	"github.com/djylb/nps/lib/logs"
 	"github.com/djylb/nps/server/connection"
 	"github.com/quic-go/quic-go"
+	"github.com/xtaci/kcp-go/v5"
 )
 
 var (
@@ -75,6 +79,41 @@ type Bridge struct {
 	p2pAssociations    *p2pAssociationManager
 	closeClientHook    atomic.Value
 	closeNodeHook      atomic.Value
+
+	// lifecycle management
+	lifeMu         sync.Mutex // serializes StartTunnel vs Shutdown; guards the fields below
+	started        bool
+	startBlocked   bool
+	intakeRejected bool          // listeners have been closed exactly once (guarded by lifeMu)
+	shutdownCh     chan struct{} // closed when shutdown begins (new connections are rejected)
+	doneCh         chan struct{} // closed when Shutdown has fully completed
+	shutdownOnce   sync.Once
+	doneOnce       sync.Once
+	shutdownMu     sync.Mutex // serializes shutdown orchestration
+	shutdownErr    error      // result of the first shutdown orchestration
+	listeners      bridgeHeldListeners
+
+	rawConns sync.Map // map[string]net.Conn tracked during connection intake
+
+	loopWG    sync.WaitGroup // accept/ping/supervisor loops
+	sessionWG sync.WaitGroup // connection/session goroutines
+}
+
+// bridgeHeldListeners holds the underlying listeners created at startup so
+// they can be explicitly closed during shutdown.
+type bridgeHeldListeners struct {
+	tcp         net.Listener
+	tls         net.Listener
+	ws          net.Listener
+	wss         net.Listener
+	reservedTLS net.Listener
+	// wsGateway/wssGateway are the websocket upgrade wrappers between the
+	// virtual listeners and the bridge handlers; they have their own
+	// close channel and must be closed to unblock their Accept loops.
+	wsGateway   net.Listener
+	wssGateway  net.Listener
+	kcp         *kcp.Listener
+	quicRuntime *conn.QUICListenerRuntime
 }
 
 func NewTunnel(ipVerify bool, runList *sync.Map, disconnectTime int) *Bridge {
@@ -86,6 +125,8 @@ func NewTunnel(ipVerify bool, runList *sync.Map, disconnectTime int) *Bridge {
 		SecretChan:      make(chan *conn.Secret, 100),
 		runList:         runList,
 		p2pAssociations: newP2PAssociationManager(),
+		shutdownCh:      make(chan struct{}),
+		doneCh:          make(chan struct{}),
 	}
 	bridge.p2pSessions = newP2PSessionManager(bridge.p2pAssociations)
 	bridge.ipVerify.Store(ipVerify)
@@ -437,11 +478,16 @@ func (s *Bridge) ping() {
 	ticker := time.NewTicker(time.Second * 5)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		closedClients := s.collectPingClosedClients()
-		for _, clientId := range closedClients {
-			logs.Info("the client %d closed", clientId)
-			s.DelClient(clientId)
+	for {
+		select {
+		case <-s.shutdownCh:
+			return
+		case <-ticker.C:
+			closedClients := s.collectPingClosedClients()
+			for _, clientId := range closedClients {
+				logs.Info("the client %d closed", clientId)
+				s.DelClient(clientId)
+			}
 		}
 	}
 }
@@ -484,6 +530,272 @@ func (s *Bridge) collectPingClosedClients() []int {
 		return true
 	})
 	return closedClients
+}
+
+// Shutdown errors returned to callers / recorded as explicit failure.
+var (
+	ErrBridgeShuttingDown   = errors.New("bridge is shutting down")
+	ErrBridgeAlreadyStarted = errors.New("bridge already started")
+	ErrSessionsNotDrained   = errors.New("sessions were not drained before the deadline")
+	ErrLoopsNotStopped      = errors.New("background loops did not stop before the deadline")
+)
+
+// IsShuttingDown reports whether graceful shutdown has begun.
+func (s *Bridge) IsShuttingDown() bool {
+	if s == nil {
+		return true
+	}
+	select {
+	case <-s.shutdownCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// ShutdownChan is closed once graceful shutdown begins.
+func (s *Bridge) ShutdownChan() <-chan struct{} { return s.shutdownCh }
+
+// Done is closed when a Shutdown call has fully completed.
+func (s *Bridge) Done() <-chan struct{} { return s.doneCh }
+
+// sessionGo runs fn on a tracked session goroutine. Any panic is recovered so
+// a faulty sub-runtime cannot crash the process or wedge the WaitGroup.
+func (s *Bridge) sessionGo(fn func()) {
+	s.sessionWG.Add(1)
+	go func() {
+		defer s.sessionWG.Done()
+		defer recoverSessionPanic()
+		fn()
+	}()
+}
+
+// loopGo runs fn on a tracked loop goroutine.
+func (s *Bridge) loopGo(fn func()) {
+	s.loopWG.Add(1)
+	go func() {
+		defer s.loopWG.Done()
+		defer recoverSessionPanic()
+		fn()
+	}()
+}
+
+func recoverSessionPanic() {
+	if r := recover(); r != nil {
+		logs.Error("bridge sub-runtime panic recovered: %v", r)
+	}
+}
+
+// trackConn registers a raw connection during intake so it can be forcibly
+// closed if shutdown begins while it is still being processed.
+func (s *Bridge) trackConn(c net.Conn) net.Conn {
+	if c == nil {
+		return nil
+	}
+	s.rawConns.Store(rawConnKey(c), c)
+	return c
+}
+
+func (s *Bridge) untrackConn(c net.Conn) {
+	if c == nil {
+		return
+	}
+	s.rawConns.Delete(rawConnKey(c))
+}
+
+func rawConnKey(c net.Conn) string {
+	return fmt.Sprintf("%p", c)
+}
+
+// closeTrackedConns force-closes every connection currently being taken in.
+func (s *Bridge) closeTrackedConns() {
+	s.rawConns.Range(func(_, value any) bool {
+		if c, ok := value.(net.Conn); ok {
+			_ = c.Close()
+		}
+		return true
+	})
+}
+
+// waitForWG blocks until wg is drained or ctx is done. It reports whether the
+// group drained. A helper goroutine is used to bridge WaitGroup (no context)
+// into a select; it exits as soon as the group drains.
+func waitForWG(ctx context.Context, wg *sync.WaitGroup) bool {
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// BeginShutdown immediately rejects new intake on every protocol without
+// waiting for existing sessions to drain. It lets a host process stop new
+// connections, flush writers and only afterwards call Shutdown to drain and
+// force-close. Idempotent and safe for concurrent invocation.
+func (s *Bridge) BeginShutdown() {
+	s.shutdownOnce.Do(func() { close(s.shutdownCh) })
+	// Serialize against StartTunnel so all startup resources are registered
+	// before the listeners are closed.
+	s.lifeMu.Lock()
+	s.startBlocked = true
+	// Every concurrent caller invokes BeginShutdown; only the first one may
+	// close the listeners (a second Close has no benefit and surfaces as a
+	// duplicate close to instrumented listeners).
+	if !s.intakeRejected {
+		s.rejectNewConnectionsLocked()
+		s.intakeRejected = true
+	}
+	s.lifeMu.Unlock()
+}
+
+// Shutdown performs a bounded graceful shutdown:
+//  1. New connections on every protocol are rejected immediately.
+//  2. Existing sessions may complete within the grace period.
+//  3. Any session remaining after grace is forcibly closed.
+//  4. All goroutines are reclaimed, bounded by ctx.
+//
+// It is idempotent and safe for concurrent invocation; concurrent callers
+// block until the first call completes and share its result.
+func (s *Bridge) Shutdown(ctx context.Context, grace time.Duration) error {
+	s.BeginShutdown()
+
+	// Only one caller orchestrates the shutdown; concurrent callers wait for
+	// it to finish and return the same result (no double force-close).
+	s.shutdownMu.Lock()
+	defer s.shutdownMu.Unlock()
+	select {
+	case <-s.doneCh:
+		return s.shutdownErr
+	default:
+	}
+
+	err := s.runShutdown(ctx, grace)
+	s.shutdownErr = err
+	s.doneOnce.Do(func() { close(s.doneCh) })
+	return err
+}
+
+func (s *Bridge) runShutdown(ctx context.Context, grace time.Duration) error {
+	var failures []error
+
+	// Grace period: wait for in-flight sessions to finish naturally.
+	if grace > 0 {
+		graceCtx, cancel := context.WithTimeout(ctx, grace)
+		waitForWG(graceCtx, &s.sessionWG)
+		cancel()
+	}
+
+	// Force-close everything that remains.
+	s.forceCloseSessions()
+
+	if ctx.Err() == nil {
+		if !waitForWG(ctx, &s.sessionWG) {
+			failures = append(failures, ErrSessionsNotDrained)
+		}
+		if !waitForWG(ctx, &s.loopWG) {
+			failures = append(failures, ErrLoopsNotStopped)
+		}
+	} else {
+		failures = append(failures, ctx.Err())
+	}
+
+	return errors.Join(failures...)
+}
+
+// rejectNewConnectionsLocked stops intake on every protocol. It must be called
+// with lifeMu held.
+func (s *Bridge) rejectNewConnectionsLocked() {
+	for _, l := range []net.Listener{
+		s.listeners.tcp,
+		s.listeners.tls,
+		s.listeners.ws,
+		s.listeners.wss,
+		s.listeners.reservedTLS,
+	} {
+		if l != nil {
+			_ = l.Close()
+		}
+	}
+	// QUIC Close rejects new connections/cancels handshakes without affecting
+	// already established connections. The UDP socket is released later in
+	// force-close after established sessions have gone.
+	if s.listeners.quicRuntime != nil && s.listeners.quicRuntime.Listener != nil {
+		_ = s.listeners.quicRuntime.Listener.Close()
+	}
+	// KCP sessions share the listener socket, so it is intentionally left open
+	// until force-close; the intake handler rejects brand-new sessions instead.
+}
+
+// forceCloseSessions forcibly terminates all established sessions and
+// releases every listening socket.
+func (s *Bridge) forceCloseSessions() {
+	// Abort bridge-mediated P2P negotiations; closes their control connections.
+	if s.p2pSessions != nil {
+		s.p2pSessions.abortAll("server shutdown")
+	}
+	// Close any connection still inside intake (handshake / first work read).
+	s.closeTrackedConns()
+	// Close all established clients: closes nodes, tunnels and signals
+	// (including QUIC connections).
+	s.Client.Range(func(_, value any) bool {
+		if client, ok := value.(*Client); ok && client != nil {
+			_ = client.Close()
+		}
+		return true
+	})
+	// Release the KCP listening socket now that its sessions are gone.
+	if s.listeners.kcp != nil {
+		_ = s.listeners.kcp.Close()
+	}
+	// Release the QUIC transport and its UDP socket: rejects late handshakes
+	// and makes the port immediately rebindable.
+	if s.listeners.quicRuntime != nil {
+		_ = s.listeners.quicRuntime.Release()
+	}
+	// Close virtual listeners: unblocks the virtual-side accept loops and
+	// drains queued, not-yet-processed connections.
+	for _, vl := range []*conn.VirtualListener{
+		s.VirtualTcpListener,
+		s.VirtualTlsListener,
+		s.VirtualWsListener,
+		s.VirtualWssListener,
+	} {
+		if vl != nil {
+			_ = vl.Close()
+		}
+	}
+	// Close the websocket upgrade gateways: unblocks their Accept loops and
+	// stops the embedded HTTP servers, releasing the virtual listeners.
+	for _, gl := range []net.Listener{s.listeners.wsGateway, s.listeners.wssGateway} {
+		if gl != nil {
+			_ = gl.Close()
+		}
+	}
+	// Drain any secret connection waiting in the dispatch channel.
+	s.drainSecretChan()
+}
+
+// drainSecretChan closes secret connections queued for processing.
+func (s *Bridge) drainSecretChan() {
+	if s.SecretChan == nil {
+		return
+	}
+	for {
+		select {
+		case secret := <-s.SecretChan:
+			if secret != nil && secret.Conn != nil {
+				_ = secret.Conn.Close()
+			}
+		default:
+			return
+		}
+	}
 }
 
 var (
@@ -607,44 +919,81 @@ func bootstrapBridgeListeners() (_ *bridgeListenerBootstrap, err error) {
 	return bootstrap, nil
 }
 
+// sessionSpawn returns a conn.HandlerSpawn that schedules handlers on tracked
+// session goroutines (Add happens synchronously, before the goroutine starts).
+func (s *Bridge) sessionSpawn() conn.HandlerSpawn {
+	return func(fn func()) { s.sessionGo(fn) }
+}
+
+// intake tracks raw during connection intake (handshake and the first work
+// dispatch) and invokes process. If shutdown begins, raw is closed and
+// process does not run.
+func (s *Bridge) intake(raw net.Conn, process func(net.Conn)) {
+	s.trackConn(raw)
+	defer s.untrackConn(raw)
+	if s.IsShuttingDown() {
+		_ = raw.Close()
+		return
+	}
+	process(raw)
+}
+
+// clientConnHandler is the top-level handler for a newly accepted connection.
+func (s *Bridge) clientConnHandler(tunnelType string) func(net.Conn) {
+	return func(raw net.Conn) {
+		s.intake(raw, func(c net.Conn) {
+			s.CliProcess(conn.NewConn(c), tunnelType)
+		})
+	}
+}
+
 func (s *Bridge) startBridgeTCPListener(listeners *bridgeListenerBootstrap) {
 	s.VirtualTcpListener = conn.NewVirtualListener(nil)
-	go conn.Accept(s.VirtualTcpListener, func(c net.Conn) {
-		s.CliProcess(conn.NewConn(c), common.CONN_TCP)
+	s.loopGo(func() {
+		conn.AcceptTracked(s.VirtualTcpListener, s.sessionSpawn(), s.clientConnHandler(common.CONN_TCP))
 	})
 	if listeners != nil && listeners.tcpListener != nil {
 		s.VirtualTcpListener.SetAddr(listeners.tcpListener.Addr())
-		go conn.Accept(listeners.tcpListener, s.VirtualTcpListener.ServeVirtual)
+		l := listeners.tcpListener
+		vl := s.VirtualTcpListener
+		s.loopGo(func() { conn.Accept(l, vl.ServeVirtual) })
 	}
 }
 
 func (s *Bridge) startBridgeTLSListener(listeners *bridgeListenerBootstrap) {
 	s.VirtualTlsListener = conn.NewVirtualListener(nil)
-	if listeners != nil && listeners.useReservedTLSGateway {
-		go conn.Accept(s.VirtualTlsListener, func(c net.Conn) {
-			s.CliProcess(conn.NewConn(c), common.CONN_TLS)
-		})
-	} else {
-		go conn.Accept(s.VirtualTlsListener, func(c net.Conn) {
-			tlsConn := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{crypt.GetCert()}})
+	tlsHandler := func(c net.Conn) {
+		s.intake(c, func(plain net.Conn) {
+			tlsConn := tls.Server(plain, &tls.Config{Certificates: []tls.Certificate{crypt.GetCert()}})
 			s.CliProcess(conn.NewConn(tlsConn), common.CONN_TLS)
 		})
 	}
+	if listeners != nil && listeners.useReservedTLSGateway {
+		tlsHandler = s.clientConnHandler(common.CONN_TLS)
+	}
+	s.loopGo(func() {
+		conn.AcceptTracked(s.VirtualTlsListener, s.sessionSpawn(), tlsHandler)
+	})
 	if listeners != nil && listeners.tlsListener != nil {
 		s.VirtualTlsListener.SetAddr(listeners.tlsListener.Addr())
-		go conn.Accept(listeners.tlsListener, s.VirtualTlsListener.ServeVirtual)
+		l := listeners.tlsListener
+		vl := s.VirtualTlsListener
+		s.loopGo(func() { conn.Accept(l, vl.ServeVirtual) })
 	}
 }
 
 func (s *Bridge) startBridgeWSListener(listeners *bridgeListenerBootstrap, bridgeCfg connection.BridgeRuntimeConfig) {
 	s.VirtualWsListener = conn.NewVirtualListener(nil)
 	wsLn := conn.NewWSListener(s.VirtualWsListener, bridgeCfg.Path, bridgeCfg.TrustedIPs, bridgeCfg.RealIPHeader)
-	go conn.Accept(wsLn, func(c net.Conn) {
-		s.CliProcess(conn.NewConn(c), common.CONN_WS)
+	s.listeners.wsGateway = wsLn
+	s.loopGo(func() {
+		conn.AcceptTracked(wsLn, s.sessionSpawn(), s.clientConnHandler(common.CONN_WS))
 	})
 	if listeners != nil && listeners.wsListener != nil {
 		s.VirtualWsListener.SetAddr(listeners.wsListener.Addr())
-		go conn.Accept(listeners.wsListener, s.VirtualWsListener.ServeVirtual)
+		l := listeners.wsListener
+		vl := s.VirtualWsListener
+		s.loopGo(func() { conn.Accept(l, vl.ServeVirtual) })
 	}
 }
 
@@ -654,12 +1003,15 @@ func (s *Bridge) startBridgeWSSListener(listeners *bridgeListenerBootstrap, brid
 	if listeners != nil && listeners.useReservedTLSGateway {
 		wssLn = conn.NewWSListener(s.VirtualWssListener, bridgeCfg.Path, bridgeCfg.TrustedIPs, bridgeCfg.RealIPHeader)
 	}
-	go conn.Accept(wssLn, func(c net.Conn) {
-		s.CliProcess(conn.NewConn(c), common.CONN_WSS)
+	s.listeners.wssGateway = wssLn
+	s.loopGo(func() {
+		conn.AcceptTracked(wssLn, s.sessionSpawn(), s.clientConnHandler(common.CONN_WSS))
 	})
 	if listeners != nil && listeners.wssListener != nil {
 		s.VirtualWssListener.SetAddr(listeners.wssListener.Addr())
-		go conn.Accept(listeners.wssListener, s.VirtualWssListener.ServeVirtual)
+		l := listeners.wssListener
+		vl := s.VirtualWssListener
+		s.loopGo(func() { conn.Accept(l, vl.ServeVirtual) })
 	}
 }
 
@@ -669,23 +1021,26 @@ func (s *Bridge) startBridgeReservedTLSGateway(listeners *bridgeListenerBootstra
 	}
 	s.VirtualTlsListener.SetAddr(listeners.reservedTLSListener.Addr())
 	s.VirtualWssListener.SetAddr(listeners.reservedTLSListener.Addr())
-	go conn.Accept(listeners.reservedTLSListener, s.handleReservedTLSConn)
+	l := listeners.reservedTLSListener
+	s.loopGo(func() {
+		conn.AcceptTracked(l, s.sessionSpawn(), s.handleReservedTLSConn)
+	})
 }
 
 func (s *Bridge) startBridgeKCPListener(bridgeCfg connection.BridgeRuntimeConfig) {
 	if !ServerKcpEnable {
 		return
 	}
-	logs.Info("Server start, the bridge type is kcp, the bridge port is %d", bridgeCfg.KCPPort)
-	go func() {
-		addr := common.BuildAddress(bridgeCfg.KCPIP, strconv.Itoa(bridgeCfg.KCPPort))
-		err := conn.NewKcpListenerAndProcess(addr, func(c net.Conn) {
-			s.CliProcess(conn.NewConn(c), "kcp")
-		})
-		if err != nil {
-			logs.Error("KCP listener error: %v", err)
-		}
-	}()
+	addr := common.BuildAddress(bridgeCfg.KCPIP, strconv.Itoa(bridgeCfg.KCPPort))
+	kcpLn, err := conn.NewKcpListener(addr)
+	if err != nil {
+		logs.Error("KCP listener error: %v", err)
+		return
+	}
+	s.listeners.kcp = kcpLn
+	s.loopGo(func() {
+		_ = conn.ServeKCP(kcpLn, s.sessionSpawn(), s.IsShuttingDown, s.clientConnHandler("kcp"))
+	})
 }
 
 func buildBridgeQUICConfig(quicCfg connection.QUICRuntimeConfig) *quic.Config {
@@ -706,31 +1061,53 @@ func (s *Bridge) startBridgeQUICListener(bridgeCfg connection.BridgeRuntimeConfi
 	if !ServerQuicEnable {
 		return
 	}
-	logs.Info("Server start, the bridge type is quic, the bridge port is %d", bridgeCfg.QUICPort)
-	go func() {
-		addr := common.BuildAddress(bridgeCfg.QUICIP, strconv.Itoa(bridgeCfg.QUICPort))
-		err := conn.NewQuicListenerAndProcess(addr, buildBridgeQUICTLSConfig(quicCfg), buildBridgeQUICConfig(quicCfg), func(c net.Conn) {
-			s.CliProcess(conn.NewConn(c), "quic")
-		})
-		if err != nil {
-			logs.Error("QUIC listener error: %v", err)
-		}
-	}()
+	addr := common.BuildAddress(bridgeCfg.QUICIP, strconv.Itoa(bridgeCfg.QUICPort))
+	quicRuntime, err := conn.NewQuicListener(addr, buildBridgeQUICTLSConfig(quicCfg), buildBridgeQUICConfig(quicCfg))
+	if err != nil {
+		logs.Error("QUIC listener error: %v", err)
+		return
+	}
+	s.listeners.quicRuntime = quicRuntime
+	s.loopGo(func() {
+		_ = conn.ServeQUIC(quicRuntime.Listener, s.sessionSpawn(), s.clientConnHandler("quic"))
+	})
+}
+
+func (s *Bridge) adoptBootstrapListeners(b *bridgeListenerBootstrap) {
+	if b == nil {
+		return
+	}
+	s.listeners.tcp = b.tcpListener
+	s.listeners.tls = b.tlsListener
+	s.listeners.ws = b.wsListener
+	s.listeners.wss = b.wssListener
+	s.listeners.reservedTLS = b.reservedTLSListener
 }
 
 func (s *Bridge) StartTunnel() error {
+	s.lifeMu.Lock()
+	defer s.lifeMu.Unlock()
+	if s.startBlocked {
+		return ErrBridgeShuttingDown
+	}
+	if s.started {
+		return ErrBridgeAlreadyStarted
+	}
+
 	bridgeCfg := currentBridgeListenerRuntime()
 	quicCfg := currentBridgeQUICRuntime()
-	listeners, err := bootstrapBridgeListeners()
+	bootstrap, err := bootstrapBridgeListeners()
 	if err != nil {
 		return err
 	}
-	go s.ping()
-	s.startBridgeTCPListener(listeners)
-	s.startBridgeTLSListener(listeners)
-	s.startBridgeWSListener(listeners, bridgeCfg)
-	s.startBridgeWSSListener(listeners, bridgeCfg)
-	s.startBridgeReservedTLSGateway(listeners)
+	s.started = true
+	s.adoptBootstrapListeners(bootstrap)
+	s.loopGo(s.ping)
+	s.startBridgeTCPListener(bootstrap)
+	s.startBridgeTLSListener(bootstrap)
+	s.startBridgeWSListener(bootstrap, bridgeCfg)
+	s.startBridgeWSSListener(bootstrap, bridgeCfg)
+	s.startBridgeReservedTLSGateway(bootstrap)
 	s.startBridgeKCPListener(bridgeCfg)
 	s.startBridgeQUICListener(bridgeCfg, quicCfg)
 	return nil

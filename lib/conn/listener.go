@@ -69,12 +69,22 @@ func NewTcpListenerAndProcess(addr string, f func(c net.Conn), listener *net.Lis
 }
 
 func NewKcpListenerAndProcess(addr string, f func(c net.Conn)) error {
-	kcpListener, err := kcp.ListenWithOptions(addr, nil, 10, 3)
+	listener, err := NewKcpListener(addr)
 	if err != nil {
-		logs.Error("KCP listen error: %v", err)
 		return err
 	}
-	return serveKCPListener(kcpListener, f)
+	return serveKCPListener(listener, f)
+}
+
+// NewKcpListener creates a KCP listener without serving it, so the caller can
+// hold the returned listener and close it explicitly during shutdown.
+func NewKcpListener(addr string) (*kcp.Listener, error) {
+	listener, err := kcp.ListenWithOptions(addr, nil, 10, 3)
+	if err != nil {
+		logs.Error("KCP listen error: %v", err)
+		return nil, err
+	}
+	return listener, nil
 }
 
 type kcpSessionAccepter interface {
@@ -82,6 +92,18 @@ type kcpSessionAccepter interface {
 }
 
 func serveKCPListener(listener kcpSessionAccepter, f func(c net.Conn)) error {
+	return ServeKCP(listener, DefaultSpawn, nil, f)
+}
+
+// ServeKCP serves an existing KCP listener. Accepted sessions share the
+// listener socket, so it is not closed during graceful shutdown. If reject is
+// non-nil and returns true, a freshly accepted session is closed immediately
+// and f is not invoked, allowing brand-new sessions to be rejected while
+// already-established ones keep running.
+func ServeKCP(listener kcpSessionAccepter, spawn HandlerSpawn, reject func() bool, f func(c net.Conn)) error {
+	if spawn == nil {
+		spawn = DefaultSpawn
+	}
 	for {
 		c, err := listener.AcceptKCP()
 		if err != nil {
@@ -92,20 +114,94 @@ func serveKCPListener(listener kcpSessionAccepter, f func(c net.Conn)) error {
 			continue
 		}
 		SetUdpSession(c)
-		go f(c)
+		if reject != nil && reject() {
+			_ = c.Close()
+			continue
+		}
+		session := c
+		spawn(func() { f(session) })
 	}
 }
 
 func NewQuicListenerAndProcess(addr string, tlsConfig *tls.Config, quicConfig *quic.Config, f func(c net.Conn)) error {
-	listener, err := quic.ListenAddr(addr, tlsConfig, quicConfig)
+	runtime, err := NewQuicListener(addr, tlsConfig, quicConfig)
 	if err != nil {
-		logs.Error("QUIC listen error: %v", err)
 		return err
 	}
-	return serveQUICListener(listener, f)
+	return serveQUICListener(runtime.Listener, f)
+}
+
+// QUICListenerRuntime groups a QUIC listener with the transport and UDP
+// socket backing it. quic-go ties socket release to transport shutdown, so
+// callers must explicitly release the runtime once established connections
+// have been closed.
+type QUICListenerRuntime struct {
+	Listener   *quic.Listener
+	Transport  *quic.Transport
+	PacketConn *net.UDPConn
+}
+
+// NewQuicListener creates a QUIC listener without serving it. Closing
+// Listener immediately rejects new connections and cancels in-flight
+// handshakes, but does not affect already established connections; the UDP
+// socket stays open until Release is called.
+func NewQuicListener(addr string, tlsConfig *tls.Config, quicConfig *quic.Config) (*QUICListenerRuntime, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		logs.Error("QUIC listen resolve error: %v", err)
+		return nil, err
+	}
+	packetConn, err := net.ListenUDP("udp", udpAddr)
+	if err != nil {
+		logs.Error("QUIC listen error: %v", err)
+		return nil, err
+	}
+	transport := &quic.Transport{Conn: packetConn}
+	listener, err := transport.Listen(tlsConfig, quicConfig)
+	if err != nil {
+		_ = packetConn.Close()
+		logs.Error("QUIC listener error: %v", err)
+		return nil, err
+	}
+	return &QUICListenerRuntime{
+		Listener:   listener,
+		Transport:  transport,
+		PacketConn: packetConn,
+	}, nil
+}
+
+// Release shuts down the transport and closes the underlying UDP socket. It
+// must be called only after established connections have been closed:
+// Transport.Close aborts remaining connections without a QUIC close frame.
+// Idempotent.
+func (r *QUICListenerRuntime) Release() error {
+	if r == nil {
+		return nil
+	}
+	var err error
+	if r.Transport != nil {
+		err = r.Transport.Close()
+		r.Transport = nil
+	}
+	if r.PacketConn != nil {
+		if closeErr := r.PacketConn.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+		r.PacketConn = nil
+	}
+	return err
 }
 
 func serveQUICListener(listener *quic.Listener, f func(c net.Conn)) error {
+	return ServeQUIC(listener, DefaultSpawn, f)
+}
+
+// ServeQUIC serves an existing QUIC listener, using spawn to schedule the
+// per-connection goroutine so the caller can track it.
+func ServeQUIC(listener *quic.Listener, spawn HandlerSpawn, f func(c net.Conn)) error {
+	if spawn == nil {
+		spawn = DefaultSpawn
+	}
 	pending := newPendingQUICSessions()
 	defer pending.closeAll()
 
@@ -119,7 +215,8 @@ func serveQUICListener(listener *quic.Listener, f func(c net.Conn)) error {
 			continue
 		}
 		pending.add(sess)
-		go serveAcceptedQUICSession(sess, pending, f)
+		conn := sess
+		spawn(func() { serveAcceptedQUICSession(conn, pending, f) })
 	}
 }
 
@@ -203,21 +300,45 @@ func shouldStopKCPAcceptLoop(err error) bool {
 		strings.Contains(err.Error(), "the mux has closed")
 }
 
+// HandlerSpawn schedules a connection handler to run asynchronously.
+// Implementations MUST perform any WaitGroup.Add() synchronously, before the
+// goroutine starts (Add-happens-before-Go), so concurrent Wait callers
+// cannot observe a zero counter prematurely.
+type HandlerSpawn func(fn func())
+
+// DefaultSpawn runs fn on a new, untracked goroutine.
+func DefaultSpawn(fn func()) { go fn() }
+
+// Accept accepts connections from l and invokes f in a new goroutine for each
+// connection.
 func Accept(l net.Listener, f func(c net.Conn)) {
+	AcceptTracked(l, DefaultSpawn, f)
+}
+
+// AcceptTracked behaves like Accept but uses spawn to schedule each handler,
+// allowing the caller to track (e.g. WaitGroup) handler goroutines.
+func AcceptTracked(l net.Listener, spawn HandlerSpawn, f func(c net.Conn)) {
+	if l == nil {
+		return
+	}
+	if spawn == nil {
+		spawn = DefaultSpawn
+	}
 	for {
 		c, err := l.Accept()
 		if err != nil {
 			if shouldStopAcceptLoop(err) {
-				break
+				return
 			}
 			logs.Warn("%v", err)
 			continue
 		}
 		if c == nil {
 			logs.Warn("nil connection")
-			break
+			return
 		}
-		go f(c)
+		conn := c
+		spawn(func() { f(conn) })
 	}
 }
 

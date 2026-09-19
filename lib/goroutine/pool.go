@@ -37,6 +37,7 @@ type connGroup struct {
 	flows  []*file.Flow
 	task   *file.Tunnel
 	remote string
+	close  func()
 }
 
 func newConnGroup(dst, src io.ReadWriteCloser, wg *sync.WaitGroup, n *int64, flows []*file.Flow, task *file.Tunnel, remote string) connGroup {
@@ -182,6 +183,10 @@ func copyConnGroup(group interface{}) {
 		defer cg.wg.Done()
 	}
 	defer func() {
+		if cg.close != nil {
+			cg.close()
+			return
+		}
 		_ = cg.src.Close()
 		_ = cg.dst.Close()
 	}()
@@ -234,12 +239,16 @@ func copyConns(group interface{}) {
 		remoteAddr = ra.String()
 	}
 
-	if err := connCopyPool.Invoke(newConnGroup(conns.conn1, conns.conn2, wg, &in, conns.flows, conns.task, remoteAddr)); err != nil {
+	groupIn := newConnGroup(conns.conn1, conns.conn2, wg, &in, conns.flows, conns.task, remoteAddr)
+	groupIn.close = closeBoth
+	if err := connCopyPool.Invoke(groupIn); err != nil {
 		logs.Error("connCopyPool.Invoke failed: %v", err)
 		closeBoth()
 		wg.Done()
 	}
-	if err := connCopyPool.Invoke(newConnGroup(conns.conn2, conns.conn1, wg, &out, conns.flows, nil, remoteAddr)); err != nil {
+	groupOut := newConnGroup(conns.conn2, conns.conn1, wg, &out, conns.flows, nil, remoteAddr)
+	groupOut.close = closeBoth
+	if err := connCopyPool.Invoke(groupOut); err != nil {
 		logs.Error("connCopyPool.Invoke failed: %v", err)
 		closeBoth()
 		wg.Done()

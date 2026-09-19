@@ -96,6 +96,14 @@ func (c *WsConn) Close() error {
 	if c == nil || c.Conn == nil {
 		return nil
 	}
+	// Gorilla's Close closes the TCP connection without a close frame, which
+	// peers observe as an abnormal closure (1006). Send a normal close frame
+	// under a bounded deadline first; WriteControl is safe on a closed conn.
+	_ = c.Conn.WriteControl(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""),
+		time.Now().Add(time.Second),
+	)
 	return c.Conn.Close()
 }
 

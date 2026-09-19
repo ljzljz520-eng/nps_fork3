@@ -129,6 +129,22 @@ func (m *p2pSessionManager) deleteSessionIfCurrent(sessionID string, value inter
 	return m.sessions.CompareAndDelete(sessionID, value)
 }
 
+// abortAll aborts every active in-memory session with the given reason. It is
+// safe to call during shutdown: individual session aborts are idempotent.
+func (m *p2pSessionManager) abortAll(reason string) {
+	if m == nil {
+		return
+	}
+	m.sessions.Range(func(key, value any) bool {
+		session, ok := value.(*p2pBridgeSession)
+		if ok && session != nil {
+			session.abort(reason)
+		}
+		m.sessions.CompareAndDelete(key, value)
+		return true
+	})
+}
+
 func (s *p2pBridgeSession) attachProvider(control *conn.Conn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()

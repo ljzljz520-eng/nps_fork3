@@ -618,6 +618,21 @@ func NewStateWithApp(app *webapi.App) *State {
 			Fields:   fields,
 		})
 	}
+	// Register bounded flush/close of asynchronous node state (event) writers
+	// so shutdown drains them before force-closing sessions.
+	server.RegisterEventWriterFlush(func(ctx context.Context) error {
+		done := make(chan struct{})
+		go func() {
+			closeAllNodeRuntimeStateWriters()
+			close(done)
+		}()
+		select {
+		case <-done:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
 	return state
 }
 
